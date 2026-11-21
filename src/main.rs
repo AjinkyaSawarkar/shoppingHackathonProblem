@@ -1,6 +1,79 @@
 // Shopping Sessions pipeline. Implements rules.md exactly.
 use memmap2::Mmap;
 
+// Large allocations go straight to mmap with transparent huge pages requested,
+// so the kernel takes 2 MB page faults instead of 4 KB ones.
+struct HugeAlloc;
+const HUGE_MIN: usize = 2 << 20;
+const HUGE_ALIGN: usize = 2 << 20;
+unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= HUGE_MIN && l.align() <= 4096 {
+            unsafe { huge_map(l.size()) }
+        } else {
+            unsafe { std::alloc::System.alloc(l) }
+        }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if l.size() >= HUGE_MIN && l.align() <= 4096 {
+            unsafe { libc::munmap(p as *mut libc::c_void, round_huge(l.size())) };
+        } else {
+            unsafe { std::alloc::System.dealloc(p, l) }
+        }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        let old_big = l.size() >= HUGE_MIN && l.align() <= 4096;
+        let new_big = new >= HUGE_MIN && l.align() <= 4096;
+        unsafe {
+            if old_big && new_big {
+                let q = libc::mremap(p as *mut libc::c_void, round_huge(l.size()), round_huge(new), libc::MREMAP_MAYMOVE);
+                if q == libc::MAP_FAILED {
+                    return std::ptr::null_mut();
+                }
+                libc::madvise(q, round_huge(new), libc::MADV_HUGEPAGE);
+                return q as *mut u8;
+            }
+            if !old_big && !new_big {
+                return std::alloc::System.realloc(p, l, new);
+            }
+            let nl = std::alloc::Layout::from_size_align_unchecked(new, l.align());
+            let q = self.alloc(nl);
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                self.dealloc(p, l);
+            }
+            q
+        }
+    }
+}
+#[inline]
+fn round_huge(n: usize) -> usize {
+    (n + HUGE_ALIGN - 1) & !(HUGE_ALIGN - 1)
+}
+unsafe fn huge_map(n: usize) -> *mut u8 {
+    let len = round_huge(n);
+    unsafe {
+        // over-map to get a 2 MB aligned start, then trim
+        let raw = libc::mmap(std::ptr::null_mut(), len + HUGE_ALIGN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+        if raw == libc::MAP_FAILED {
+            return std::ptr::null_mut();
+        }
+        let a = raw as usize;
+        let start = (a + HUGE_ALIGN - 1) & !(HUGE_ALIGN - 1);
+        if start > a {
+            libc::munmap(raw, start - a);
+        }
+        let end = a + len + HUGE_ALIGN;
+        if end > start + len {
+            libc::munmap((start + len) as *mut libc::c_void, end - start - len);
+        }
+        libc::madvise(start as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+        start as *mut u8
+    }
+}
+#[global_allocator]
+static GLOBAL: HugeAlloc = HugeAlloc;
+
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
@@ -152,6 +225,22 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     Some(v)
 }
 
+/// ingest_ts is always valid F1; a fast path without checks, else the full parser.
+#[inline(always)]
+fn parse_ingest(s: &[u8]) -> i64 {
+    if s.len() == 20 && s[19] == b'Z' && s[10] == b'T' {
+        let g = |i: usize| (s[i].wrapping_sub(b'0')) as i64;
+        let y = (g(0) * 1000 + g(1) * 100 + g(2) * 10 + g(3)) as usize;
+        let mo = (g(5) * 10 + g(6)) as usize;
+        if y < 10000 && (1..=12).contains(&mo) {
+            let leap = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) as usize;
+            let days = (year_days()[y] + CUM[leap][mo - 1]) as i64 + g(8) * 10 + g(9) - 1;
+            return (days * 86400 + (g(11) * 10 + g(12)) * 3600 + (g(14) * 10 + g(15)) * 60 + g(17) * 10 + g(18)) * 1000;
+        }
+    }
+    parse_ts(s).unwrap_or(i64::MAX)
+}
+
 #[inline(always)]
 fn parse_iso(s: &[u8]) -> Option<i64> {
     let n = s.len();
@@ -295,14 +384,14 @@ unsafe fn fill_masks_avx2(buf: &[u8], dm: &mut Vec<u64>, qm: &mut Vec<u64>) {
             let d1 = _mm256_or_si256(_mm256_cmpeq_epi8(v1, cm), _mm256_cmpeq_epi8(v1, nm));
             let q0 = _mm256_cmpeq_epi8(v0, qq);
             let q1 = _mm256_cmpeq_epi8(v1, qq);
-            *dm.get_unchecked_mut(w) = (_mm256_movemask_epi8(d0) as u32 as u64) | ((_mm256_movemask_epi8(d1) as u32 as u64) << 32);
-            *qm.get_unchecked_mut(w) = (_mm256_movemask_epi8(q0) as u32 as u64) | ((_mm256_movemask_epi8(q1) as u32 as u64) << 32);
+            *dm.get_unchecked_mut(w + 1) = (_mm256_movemask_epi8(d0) as u32 as u64) | ((_mm256_movemask_epi8(d1) as u32 as u64) << 32);
+            *qm.get_unchecked_mut(w + 1) = (_mm256_movemask_epi8(q0) as u32 as u64) | ((_mm256_movemask_epi8(q1) as u32 as u64) << 32);
         }
     }
 }
 
 fn fill_masks(buf: &[u8], dm: &mut Vec<u64>, qm: &mut Vec<u64>) {
-    let words = buf.len().div_ceil(64) + 1;
+    let words = buf.len().div_ceil(64) + 2;
     dm.clear();
     qm.clear();
     dm.resize(words, 0);
@@ -319,13 +408,13 @@ fn fill_masks(buf: &[u8], dm: &mut Vec<u64>, qm: &mut Vec<u64>) {
     let done = 0;
     for w in done..full {
         let (d, q) = masks_scalar(&buf[w * 64..w * 64 + 64]);
-        dm[w] = d;
-        qm[w] = q;
+        dm[w + 1] = d;
+        qm[w + 1] = q;
     }
     if buf.len() % 64 != 0 {
         let (d, q) = masks_scalar(&buf[full * 64..]);
-        dm[full] = d;
-        qm[full] = q;
+        dm[full + 1] = d;
+        qm[full + 1] = q;
     }
 }
 
@@ -374,26 +463,32 @@ fn scan<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(buf: &[u8], mut cb: F
             if f != N {
                 return;
             }
+            let total_q = popcnt_range(qm, ls + 64, end + 64);
+            if total_q == 0 {
+                cb(buf, fields);
+                return;
+            }
             let mut bad = 0u32;
             let mut cnt = 0u32;
             for fl in fields.iter_mut() {
                 let (a, e) = (fl.0 as usize, fl.1 as usize);
-                let l = e - a;
-                let qs = if l > 0 { bit(qm, a) } else { 0 };
-                let qe = if l > 0 { bit(qm, e - 1) } else { 0 };
-                bad |= (qs ^ qe) | (qs & (l < 2) as u32);
+                // masks are offset by one word, so e - 1 + 64 never underflows;
+                // for an empty field both bits fall on delimiters, which are never quotes
+                let qs = bit(qm, a + 64);
+                let qe = bit(qm, e + 63);
+                bad |= (qs ^ qe) | (qs & ((e - a) < 2) as u32);
                 cnt += 2 * qs;
                 fl.0 += qs;
                 fl.1 -= qs;
             }
-            if bad == 0 && popcnt_range(qm, ls, end) == cnt {
+            if bad == 0 && total_q == cnt {
                 cb(buf, fields);
             }
         };
-        for w in 0..dm.len() {
+        for w in 1..dm.len() {
             let mut m = dm[w];
             while m != 0 {
-                let p = (w << 6) + m.trailing_zeros() as usize;
+                let p = ((w - 1) << 6) + m.trailing_zeros() as usize;
                 m &= m - 1;
                 if f < N {
                     fields[f] = (fs as u32, p as u32);
@@ -490,38 +585,37 @@ fn buckets<T>(n: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::new()).collect()
 }
 
-/// Counting sort of v into `out` by a key in 0..nb; returns nb + 1 offsets.
-fn partition<T: Copy>(v: &[T], nb: usize, key: impl Fn(&T) -> usize, out: &mut Vec<T>) -> Vec<usize> {
+
+/// Like partition, over several slices at once.
+fn partition_parts<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(parts: I, nb: usize, key: impl Fn(&T) -> usize, out: &mut Vec<T>) -> Vec<usize> {
     let mut cnt = vec![0usize; nb + 1];
-    for x in v {
-        cnt[key(x) + 1] += 1;
+    let mut total = 0;
+    for v in parts.clone() {
+        total += v.len();
+        for x in v {
+            cnt[key(x) + 1] += 1;
+        }
     }
     for i in 0..nb {
         cnt[i + 1] += cnt[i];
     }
     out.clear();
-    out.reserve(v.len());
+    out.reserve(total);
     let mut pos = cnt.clone();
     unsafe {
         let o = out.as_mut_ptr();
-        for x in v {
-            let k = key(x);
-            *o.add(*pos.get_unchecked(k)) = *x;
-            *pos.get_unchecked_mut(k) += 1;
+        for v in parts {
+            for x in v {
+                let k = key(x);
+                *o.add(*pos.get_unchecked(k)) = *x;
+                *pos.get_unchecked_mut(k) += 1;
+            }
         }
-        out.set_len(v.len());
+        out.set_len(total);
     }
     cnt
 }
 
-fn gather<T: Copy>(parts: &[Vec<Vec<T>>], b: usize, extra: usize) -> Vec<T> {
-    let n: usize = parts.iter().map(|p| p[b].len()).sum();
-    let mut v = Vec::with_capacity(n + extra);
-    for p in parts {
-        v.extend_from_slice(&p[b]);
-    }
-    v
-}
 
 fn read_table2(p: &Path, mut f: impl FnMut(&[u8], &[u8])) {
     let b = read_small(p);
@@ -714,7 +808,7 @@ fn main() {
                         return;
                     }
                     let ek = pack(eid);
-                    let ing = parse_ts(fl(buf, r[3])).unwrap_or(i64::MAX);
+                    let ing = parse_ingest(fl(buf, r[3]));
                     let (e0, e1) = hl(ek);
                     let mut e = Ev { e0, e1, ing, u0: 0, u1: 0, ts: 0, pc: 0 };
                     'v: {
@@ -813,11 +907,9 @@ fn main() {
     let deduped: Vec<Vec<Vec<Sv>>> = (0..NB)
         .into_par_iter()
         .fold(
-            || (buckets::<Sv>(NP), Vec::<Ev>::new(), Vec::<u32>::new()),
-            |(mut bk, mut sub, mut table), b| {
-                let v = gather(&parsed, b, 0);
-                let offs = partition(&v, NS, |e| esbkt(kk(e.e0, e.e1)), &mut sub);
-                drop(v);
+            || (buckets::<Sv>(NP), Vec::<Ev>::new(), Vec::<u32>::new(), Vec::<u32>::new()),
+            |(mut bk, mut sub, mut table, mut kept), b| {
+                let offs = partition_parts(parsed.iter().map(|p| &p[b][..]), NS, |e| esbkt(kk(e.e0, e.e1)), &mut sub);
                 for si in 0..NS {
                     let part = &sub[offs[si]..offs[si + 1]];
                     if part.is_empty() {
@@ -827,7 +919,7 @@ fn main() {
                     let mask = size - 1;
                     table.clear();
                     table.resize(size, u32::MAX);
-                    let mut kept: Vec<u32> = Vec::with_capacity(part.len());
+                    kept.clear();
                     for (i, e) in part.iter().enumerate() {
                         let mut h = mix(kk(e.e0, e.e1)) as usize & mask;
                         loop {
@@ -855,10 +947,10 @@ fn main() {
                         bk[bkt(kk(e.u0, e.u1))].push(Sv { u0: e.u0, u1: e.u1, ts: e.ts, pc: e.pc });
                     }
                 }
-                (bk, sub, table)
+                (bk, sub, table, kept)
             },
         )
-        .map(|(bk, _, _)| bk)
+        .map(|(bk, _, _, _)| bk)
         .collect();
     drop(parsed);
     lap("events deduped");
@@ -870,68 +962,58 @@ fn main() {
         ev: Vec<Vec<Sv>>,
         cl: Vec<Vec<Cl>>,
     }
-    let (stays, moved): (Vec<(Vec<Sv>, Vec<Cl>)>, Vec<Moved>) = {
-        let r: Vec<(Vec<(usize, Vec<Sv>, Vec<Cl>)>, Moved)> = (0..NP)
-            .into_par_iter()
-            .fold(
-                || (Vec::new(), Moved { ev: buckets(NP), cl: buckets(NP) }),
-                |(mut st, mut mv), b| {
-                    let lt = &link_tables[b];
-                    let mut ev = gather(&deduped, b, 0);
-                    let mut cl = gather(&cparsed, b, 0);
-                    if !lt.is_empty() {
-                        let mut w = 0;
-                        for i in 0..ev.len() {
-                            let mut e = ev[i];
-                            if let Some(&name) = lt.get(&kk(e.u0, e.u1)) {
-                                let (a, c) = hl(name);
-                                e.u0 = a;
-                                e.u1 = c;
-                                let nb = bkt(name);
-                                if nb != b {
-                                    mv.ev[nb].push(e);
-                                    continue;
-                                }
-                            }
-                            ev[w] = e;
-                            w += 1;
-                        }
-                        ev.truncate(w);
-                        let mut w = 0;
-                        for i in 0..cl.len() {
-                            let mut e = cl[i];
-                            if let Some(&name) = lt.get(&kk(e.u0, e.u1)) {
-                                let (a, c) = hl(name);
-                                e.u0 = a;
-                                e.u1 = c;
-                                let nb = bkt(name);
-                                if nb != b {
-                                    mv.cl[nb].push(e);
-                                    continue;
-                                }
-                            }
-                            cl[w] = e;
-                            w += 1;
-                        }
-                        cl.truncate(w);
-                    }
-                    st.push((b, ev, cl));
-                    (st, mv)
-                },
-            )
-            .collect();
-        let mut stays: Vec<(Vec<Sv>, Vec<Cl>)> = (0..NP).map(|_| (vec![], vec![])).collect();
-        let mut moved = vec![];
-        for (st, mv) in r {
-            for (b, ev, cl) in st {
-                stays[b] = (ev, cl);
+    // Transpose to [bucket][part] and map in place: no copy of the data.
+    fn transpose<T>(parts: Vec<Vec<Vec<T>>>, n: usize) -> Vec<Vec<Vec<T>>> {
+        let mut t: Vec<Vec<Vec<T>>> = (0..n).map(|_| Vec::new()).collect();
+        for p in parts {
+            for (b, v) in p.into_iter().enumerate() {
+                if !v.is_empty() {
+                    t[b].push(v);
+                }
             }
-            moved.push(mv);
         }
-        (stays, moved)
-    };
-    drop(deduped);
-    drop(cparsed);
+        t
+    }
+    fn map_in_place<T: Copy>(v: &mut Vec<T>, b: usize, lt: &KMap<Key>, get: impl Fn(&T) -> Key, set: impl Fn(&mut T, Key), out: &mut [Vec<T>]) {
+        let mut w = 0;
+        for i in 0..v.len() {
+            let mut e = v[i];
+            if let Some(&name) = lt.get(&get(&e)) {
+                set(&mut e, name);
+                let nb = bkt(name);
+                if nb != b {
+                    out[nb].push(e);
+                    continue;
+                }
+            }
+            v[w] = e;
+            w += 1;
+        }
+        v.truncate(w);
+    }
+    let mut ev_by_b = transpose(deduped, NP);
+    let mut cl_by_b = transpose(cparsed, NP);
+    let moved: Vec<Moved> = ev_by_b
+        .par_iter_mut()
+        .zip(cl_by_b.par_iter_mut())
+        .enumerate()
+        .fold(
+            || Moved { ev: buckets(NP), cl: buckets(NP) },
+            |mut mv, (b, (evs, cls))| {
+                let lt = &link_tables[b];
+                if !lt.is_empty() {
+                    for v in evs.iter_mut() {
+                        map_in_place(v, b, lt, |e: &Sv| kk(e.u0, e.u1), |e: &mut Sv, k| { let (a, c) = hl(k); e.u0 = a; e.u1 = c; }, &mut mv.ev);
+                    }
+                    for v in cls.iter_mut() {
+                        map_in_place(v, b, lt, |e: &Cl| kk(e.u0, e.u1), |e: &mut Cl, k| { let (a, c) = hl(k); e.u0 = a; e.u1 = c; }, &mut mv.cl);
+                    }
+                }
+                mv
+            },
+        )
+        .collect();
+    let stays: Vec<(Vec<Vec<Sv>>, Vec<Vec<Cl>>)> = ev_by_b.into_iter().zip(cl_by_b).collect();
     lap("mapped");
 
     // ------------------------------------------------ sessions per person bucket
@@ -948,30 +1030,44 @@ fn main() {
         .fold(
             || (Vec::<URow>::new(), new_acc()),
             |(mut rows, mut acc), b| {
-                let (mut ev, mut cl) = stays.lock().unwrap()[b].take().unwrap();
-                for m in &moved {
-                    ev.extend_from_slice(&m.ev[b]);
-                    cl.extend_from_slice(&m.cl[b]);
-                }
+                let (ev, cl) = stays.lock().unwrap()[b].take().unwrap();
                 let mut evp = Vec::new();
-                let eoff = partition(&ev, NS, |e| sbkt(kk(e.u0, e.u1)), &mut evp);
+                let eoff = partition_parts(ev.iter().map(|v| &v[..]).chain(moved.iter().map(|m| &m.ev[b][..])), NS, |e| sbkt(kk(e.u0, e.u1)), &mut evp);
                 drop(ev);
                 let mut clp = Vec::new();
-                let coff = partition(&cl, NS, |e| sbkt(kk(e.u0, e.u1)), &mut clp);
+                let coff = partition_parts(cl.iter().map(|v| &v[..]).chain(moved.iter().map(|m| &m.cl[b][..])), NS, |e| sbkt(kk(e.u0, e.u1)), &mut clp);
                 drop(cl);
                 let mut catsum = vec![0i64; ncat];
                 let mut touched: Vec<u32> = vec![];
                 let mut starts: Vec<u32> = vec![];
                 let mut cbuf: Vec<(u32, u32)> = vec![];
+                let mut keys: Vec<u128> = Vec::new();
+                let mut tmp_e: Vec<Sv> = Vec::new();
+                let mut tmp_c: Vec<Cl> = Vec::new();
                 for si in 0..NS {
                 let ev = &mut evp[eoff[si]..eoff[si + 1]];
                 let cl = &mut clp[coff[si]..coff[si + 1]];
-                ev.sort_unstable_by(|x, y| (x.u0, x.u1, x.ts).cmp(&(y.u0, y.u1, y.ts)));
-                cl.sort_unstable_by(|x, y| {
-                    (x.u0, x.u1, x.ts)
-                        .cmp(&(y.u0, y.u1, y.ts))
-                        .then_with(|| key_cmp(kk(y.c0, y.c1), kk(x.c0, x.c1)))
-                });
+                // Order people by (hash, id), and by time within a person.
+                let ok_e = order_by_person(ev, |e| (e.u0, e.u1), |e| e.ts, &mut keys, &mut tmp_e);
+                if !ok_e {
+                    ev.sort_unstable_by_key(|e| (mix(kk(e.u0, e.u1)), e.u0, e.u1, e.ts));
+                }
+                let ok_c = order_by_person(cl, |e| (e.u0, e.u1), |e| e.ts, &mut keys, &mut tmp_c);
+                if !ok_c {
+                    cl.sort_unstable_by_key(|e| (mix(kk(e.u0, e.u1)), e.u0, e.u1, e.ts));
+                }
+                // equal (person, ts): smallest click_id last
+                let mut q = 0;
+                while q + 1 < cl.len() {
+                    let mut r = q + 1;
+                    while r < cl.len() && cl[r].ts == cl[q].ts && cl[r].u0 == cl[q].u0 && cl[r].u1 == cl[q].u1 {
+                        r += 1;
+                    }
+                    if r - q > 1 {
+                        cl[q..r].sort_unstable_by(|x, y| key_cmp(kk(y.c0, y.c1), kk(x.c0, x.c1)));
+                    }
+                    q = r;
+                }
                 let ev = &*ev;
                 let cl = &*cl;
                 let mut ci = 0usize;
@@ -982,7 +1078,8 @@ fn main() {
                     while j < ev.len() && ev[j].u1 == p1 && ev[j].u0 == p0 {
                         j += 1;
                     }
-                    while ci < cl.len() && (cl[ci].u0, cl[ci].u1) < (p0, p1) {
+                    let hp = mix(kk(p0, p1));
+                    while ci < cl.len() && (mix(kk(cl[ci].u0, cl[ci].u1)), cl[ci].u0, cl[ci].u1) < (hp, p0, p1) {
                         ci += 1;
                     }
                     let c0 = ci;
@@ -1106,6 +1203,32 @@ fn main() {
     let assist: Vec<i64> = tot.iter().map(|x| x[3]).collect();
     write_outputs(&out, all_rows, &sess, &purch, &rev, &assist, &camp_ids, &camp_ch, &cat_names, base_day, width);
     lap("written");
+}
+
+/// Sorts v by (hash of person, ts) using one precomputed u128 key per row.
+/// Returns false if two different people share a hash (then the caller sorts exactly).
+fn order_by_person<T: Copy>(v: &mut [T], person: impl Fn(&T) -> (u64, u64), ts: impl Fn(&T) -> u32, keys: &mut Vec<u128>, tmp: &mut Vec<T>) -> bool {
+    if v.len() < 2 {
+        return true;
+    }
+    keys.clear();
+    keys.extend(v.iter().enumerate().map(|(i, e)| {
+        let (a, b) = person(e);
+        ((mix(kk(a, b)) as u128) << 64) | ((ts(e) as u128) << 32) | i as u128
+    }));
+    keys.sort_unstable();
+    tmp.clear();
+    tmp.extend(keys.iter().map(|&k| v[(k as u32) as usize]));
+    v.copy_from_slice(tmp);
+    for w in 1..keys.len() {
+        if (keys[w] >> 64) == (keys[w - 1] >> 64) {
+            let (a, b) = (person(&v[w]), person(&v[w - 1]));
+            if a != b {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn pick_top(catsum: &mut [i64], touched: &mut Vec<u32>, cat_rank: &[usize]) -> u16 {
