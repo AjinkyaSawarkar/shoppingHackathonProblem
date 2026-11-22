@@ -1,6 +1,6 @@
 # Shopping Sessions: Rust pipeline
 
-One Rust binary that implements `rules.md` exactly. It passes all 36 fixtures and matches the published 1M-event dev answer row for row.
+One Rust binary that implements `rules.md` exactly. It passes all 36 fixtures and matches the published 1M-event dev answer (scorer v5) row for row.
 
 ## How it works
 
@@ -13,7 +13,7 @@ One Rust binary that implements `rules.md` exactly. It passes all 36 fixtures an
 7. **Sessions.** Each person group is split into 64 pieces, sorted by person and time, and cut into sessions. Each session is credited to the latest click within 7 days. Assists are counted from the union of `[click, click + 7 days]` intervals per campaign.
 8. **Output.** Parquet files, one per worker for `user_daily` and one for `campaign_daily`.
 
-Every ID of up to 15 bytes is packed exactly into a 128-bit number, so matching and byte-wise ordering are exact. Longer IDs fall back to a hash with the original bytes kept on the side.
+Every ID of up to 15 bytes is packed exactly into a 128-bit number, so matching and byte-wise ordering are exact and cheap. Longer IDs (scorer v5 gives one in eight IDs a 32-character hex suffix) become a 120-bit hash, computed with no shared state. Their original bytes are recorded per thread only where the text matters: person names, click_id tie-breaks and the output.
 
 ## Run and test
 

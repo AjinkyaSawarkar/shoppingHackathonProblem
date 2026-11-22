@@ -93,9 +93,8 @@ const NS: usize = 64; // fine buckets inside a coarse one
 // A string packed exactly into a u128 when it has at most 15 bytes:
 // bytes big-endian in the high 15 bytes, length in the low byte. Comparing two
 // packed keys as integers gives byte-wise order. Longer strings get the low
-// byte 0xFF and a 120-bit hash; their bytes are kept in LONG.
+// byte 0xFF and a 120-bit hash (see pack_long).
 type Key = u128;
-static LONG: OnceLock<Mutex<HashMap<Key, Vec<u8>>>> = OnceLock::new();
 
 #[inline]
 fn pack(s: &[u8]) -> Key {
@@ -124,39 +123,107 @@ fn pack(s: &[u8]) -> Key {
     }
 }
 
-#[cold]
+/// IDs longer than 15 bytes: a 120-bit hash with the low byte 0xFF. No shared
+/// state, so it is cheap on every thread. Equal hashes are taken as equal IDs
+/// (a collision among millions of IDs has odds around 1 in 10^20).
+#[inline(never)]
 fn pack_long(s: &[u8]) -> Key {
-    let mut h1: u64 = 0xcbf29ce484222325;
-    let mut h2: u64 = 0x84222325cbf29ce4;
-    for &b in s {
-        h1 = (h1 ^ b as u64).wrapping_mul(0x100000001b3);
-        h2 = (h2 ^ b as u64).wrapping_mul(0x9E3779B97F4A7C15).rotate_left(29);
+    let n = s.len();
+    let mut h1: u64 = 0x243F6A8885A308D3 ^ (n as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let mut h2: u64 = 0x13198A2E03707344 ^ n as u64;
+    let mut i = 0;
+    while i + 8 <= n {
+        let w = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        h1 = (h1 ^ w).wrapping_mul(0xBF58476D1CE4E5B9).rotate_left(27);
+        h2 = (h2 ^ w.rotate_left(17)).wrapping_mul(0x94D049BB133111EB).rotate_left(31);
+        i += 8;
     }
-    let k = ((h1 as u128) << 64 | (h2 as u128)) | 0xFF;
-    LONG.get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .entry(k)
-        .or_insert_with(|| s.to_vec());
-    k
+    if i < n {
+        let mut t = [0u8; 8];
+        t[..n - i].copy_from_slice(&s[i..]);
+        let w = u64::from_le_bytes(t);
+        h1 = (h1 ^ w).wrapping_mul(0xBF58476D1CE4E5B9).rotate_left(27);
+        h2 = (h2 ^ w.rotate_left(17)).wrapping_mul(0x94D049BB133111EB).rotate_left(31);
+    }
+    let f = |mut x: u64| {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D049BB133111EB);
+        x ^ (x >> 31)
+    };
+    let (a, b) = (f(h1 ^ h2.rotate_left(32)), f(h2 ^ h1));
+    ((a as u128) << 64 | (b as u128)) | 0xFF
+}
+
+#[inline(always)]
+fn is_long(k: Key) -> bool {
+    (k & 0xFF) == 0xFF
+}
+
+// Original bytes of long IDs whose text is needed (names, click_id ties).
+// Each thread records into its own table; tables are merged into LONG.
+thread_local! {
+    static REG: std::cell::RefCell<KMap<&'static [u8]>> = std::cell::RefCell::new(KMap::default());
+}
+static LONG: std::sync::LazyLock<std::sync::RwLock<KMap<&'static [u8]>>> = std::sync::LazyLock::new(|| std::sync::RwLock::new(KMap::default()));
+
+/// Remember the bytes of a long key. `s` must live for the whole run (mmapped input).
+#[inline(always)]
+fn reg(k: Key, s: &[u8]) {
+    if is_long(k) {
+        reg_slow(k, s);
+    }
+}
+#[inline(never)]
+fn reg_slow(k: Key, s: &[u8]) {
+    let s: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(s) };
+    REG.with(|r| {
+        r.borrow_mut().entry(k).or_insert(s);
+    });
+}
+/// Move every thread's table into LONG (also the calling thread's).
+fn merge_reg() {
+    let parts: Vec<KMap<&'static [u8]>> = rayon::broadcast(|_| REG.with(|r| std::mem::take(&mut *r.borrow_mut())));
+    let mut g = LONG.write().unwrap();
+    for p in parts.into_iter().chain(std::iter::once(REG.with(|r| std::mem::take(&mut *r.borrow_mut())))) {
+        if g.is_empty() {
+            *g = p;
+        } else {
+            g.extend(p);
+        }
+    }
 }
 
 fn unpack(k: Key) -> Vec<u8> {
     let n = (k & 0xFF) as usize;
     if n == 0xFF {
-        LONG.get().unwrap().lock().unwrap()[&k].clone()
+        LONG.read().unwrap()[&k].to_vec()
     } else {
         k.to_be_bytes()[..n].to_vec()
     }
 }
 
+/// Byte-wise comparison of the strings behind two keys.
 #[inline]
 fn key_cmp(a: Key, b: Key) -> std::cmp::Ordering {
-    if (a & 0xFF) == 0xFF || (b & 0xFF) == 0xFF {
-        unpack(a).cmp(&unpack(b))
+    if is_long(a) || is_long(b) {
+        let g = LONG.read().unwrap();
+        key_cmp_in(&g, a, b)
     } else {
         a.cmp(&b)
     }
+}
+
+#[inline]
+fn key_cmp_in(g: &KMap<&'static [u8]>, a: Key, b: Key) -> std::cmp::Ordering {
+    if !is_long(a) && !is_long(b) {
+        return a.cmp(&b);
+    }
+    let (ba, bb) = (a.to_be_bytes(), b.to_be_bytes());
+    let sa: &[u8] = if is_long(a) { g[&a] } else { &ba[..(a & 0xFF) as usize] };
+    let sb: &[u8] = if is_long(b) { g[&b] } else { &bb[..(b & 0xFF) as usize] };
+    sa.cmp(sb)
 }
 
 #[inline]
@@ -713,12 +780,16 @@ fn main() {
                     let a = fl(buf, r[0]);
                     let b = fl(buf, r[1]);
                     if !a.is_empty() && !b.is_empty() {
-                        v.push((pack(a), pack(b)));
+                        let (ka, kb) = (pack(a), pack(b));
+                        reg(ka, a);
+                        reg(kb, b);
+                        v.push((ka, kb));
                     }
                 });
                 v
             })
             .collect();
+        merge_reg();
         lap("links parsed");
         let mut ent: Vec<(Key, u32)> = Vec::with_capacity(pairs.len() * 2);
         for (i, &(a, b)) in pairs.iter().enumerate() {
@@ -761,13 +832,14 @@ fn main() {
         lap("union");
         // ids is sorted by u128, which is byte order for short keys, so the
         // smallest index in a set is its smallest ID unless long keys are involved.
-        let any_long = ids.iter().any(|&k| (k & 0xFF) == 0xFF);
+        let any_long = ids.iter().any(|&k| is_long(k));
+        let g = LONG.read().unwrap();
         let mut best: Vec<u32> = (0..ids.len() as u32).collect();
         let mut root = vec![0u32; ids.len()];
         for i in 0..ids.len() as u32 {
             let r = find(&mut parent, i);
             root[i as usize] = r;
-            if any_long && key_cmp(ids[i as usize], ids[best[r as usize] as usize]).is_lt() {
+            if any_long && key_cmp_in(&g, ids[i as usize], ids[best[r as usize] as usize]).is_lt() {
                 best[r as usize] = i;
             }
         }
@@ -855,7 +927,9 @@ fn main() {
                             _ => break 'v,
                         }
                         e.ts = (ts - t_zero) as u32;
-                        let (u0, u1) = hl(pack(u));
+                        let uk = pack(u);
+                        reg(uk, u);
+                        let (u0, u1) = hl(uk);
                         e.u0 = u0;
                         e.u1 = u1;
                     }
@@ -893,14 +967,18 @@ fn main() {
                         None => return,
                     };
                     let uk = pack(u);
+                    reg(uk, u);
+                    let ck = pack(cid);
+                    reg(ck, cid);
                     let (u0, u1) = hl(uk);
-                    let (c0, c1) = hl(pack(cid));
+                    let (c0, c1) = hl(ck);
                     bk[bkt(uk)].push(Cl { u0, u1, c0, c1, ts: (ts - t_zero) as u32, camp: cp });
                 });
                 bk
             },
         )
         .collect();
+    merge_reg();
     lap("clicks parsed");
 
     // ------------------------------------------------ dedup events -> user buckets
